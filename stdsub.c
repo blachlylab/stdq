@@ -11,8 +11,11 @@
 
 int main(int argc, char **argv)
 {
-    // number read and emitted
-    uint64_t nlines = 0;
+    uint64_t nlines = 0;        // number read and emitted
+    uint64_t seqno = 0;         // message sequence/serial no. for detection of dropped messages
+    uint64_t last_seqno = 0;    // last seq/serial no. seen
+    int more;                   // bool multipart
+    size_t more_size = sizeof(more);
 
     size_t buflen = 1048576;
     char *line = malloc(buflen);
@@ -20,11 +23,13 @@ int main(int argc, char **argv)
 
     int opt;
     int send_eot = 0;   // option: propagate EOT marker byte (but don't close stdout)
-    while ((opt = getopt(argc, argv, "e")) != -1) {
+    int term_at_eot = 0;// option: close stdout and terminate if EOT recv'd
+    while ((opt = getopt(argc, argv, "et")) != -1) {
         switch (opt) {
             case 'e': send_eot = 1; break;
+            case 't': term_at_eot = 1; break;
             default:
-                fprintf(stderr, "Usage: %s [-e] [socket addr]\tDefault socket address: %s\n", argv[0], addr);
+                fprintf(stderr, "Usage: %s [-e] [-t] [socket addr]\tDefault socket address: %s\n", argv[0], addr);
                 exit(EXIT_FAILURE);
         }
     }
@@ -51,9 +56,38 @@ int main(int argc, char **argv)
     assert(rc == 0);
 
     jlog("Streaming queue to stdout");
-    if (send_eot) jlog("Option: Propagate EOT marker");
+    if (send_eot)       jlog("Option: Propagate EOT marker");
+    if (term_at_eot)    jlog("Option: Terminate at EOT marker");
     while (1) {
-        int nbytes = zmq_recv(subscriber, line, buflen, 0);
+        int nbytes = zmq_recv(subscriber, &seqno, sizeof(seqno), 0);
+        if (!seqno) {
+            jlog("EOT (%llu lines received, %llu dropped)", nlines, last_seqno - nlines);
+            if (send_eot) {
+                line[0] = EOT;  // assignment previously was not required as EOT was recv'd in-band
+                line[1] = '\n'; // consumer likely to be line-oriented
+                write(STDOUT_FILENO, line, 2);
+                fflush(stdout);
+            }
+            if (term_at_eot) break;
+            else {
+                last_seqno = 0;
+                continue;           // signal only, no message
+            }
+        }
+        else if (seqno > ++last_seqno ) {
+            jlog("Missed %llu messages (%llu, %llu)", (seqno - last_seqno), seqno, last_seqno);
+            last_seqno = seqno;
+        }
+        else if (seqno < last_seqno) {
+            // this could happen if:
+            //  1. we missed an EOT previously
+            //  2. logic error mismatch between stdpub/stdsub
+            //  3. ???
+            jlog("seqno (%llu) unexpectedly less than ++last_seqno (%llu)", seqno, last_seqno);
+            last_seqno = seqno;
+        }
+        rc = zmq_getsockopt(subscriber, ZMQ_RCVMORE, &more, &more_size);
+        nbytes = zmq_recv(subscriber, line, buflen, 0);
 
         if ( nbytes > (buflen >> 1)  )
         {
@@ -75,21 +109,15 @@ int main(int argc, char **argv)
             }
         }
 
-        if (nbytes == 1 && line[0] == EOT) {
-            jlog("EOT");
-            if (send_eot) {
-                line[1] = '\n'; // consumer likely to be line-oriented
-                write(STDOUT_FILENO, line, 2);
-                fflush(stdout);
-            }
-        }
-        else {
+        write(STDOUT_FILENO, line, nbytes); 
             write(STDOUT_FILENO, line, nbytes); 
-            nlines++;
-        }
+        write(STDOUT_FILENO, line, nbytes); 
+        nlines++;
     }
 
+    jlog("---SUMMARY---");
     jlog("%llu lines processed", nlines);
+    jlog("%llu lines dropped", (last_seqno - nlines));
 
     jlog("ZMQ shutdown");
     zmq_close(subscriber);

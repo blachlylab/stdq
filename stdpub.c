@@ -13,6 +13,7 @@ int main(int argc, char **argv)
 {
     // number read and published
     uint64_t nlines = 0;
+    const uint64_t eot_signal = 0;
 
     size_t buflen = 1048576;
     char *line = malloc(buflen);
@@ -43,11 +44,15 @@ int main(int argc, char **argv)
             break;
         nlines++;
         
+        // nlines === sequence no, starting from 1
+        zmq_send(publisher, &nlines, sizeof(nlines), ZMQ_SNDMORE);
         zmq_send(publisher, line, linelen, 0);
     }
-    // Issue EOT marker
-    char eot[1] = {EOT};
-    zmq_send(publisher, eot, 1, 0);
+    // Issue EOT marker -- note the nlines is not incremented for this message
+    // Signal EOT
+    //  In prior version, we used an in-band EOT (0x04)
+    //  Now, with envelopes, we can set sequence no. to 0x00 to signal EOT (multipart not needed)
+    zmq_send(publisher, &eot_signal, sizeof(eot_signal), 0);
 
     jlog("%llu lines processed", nlines);
 
